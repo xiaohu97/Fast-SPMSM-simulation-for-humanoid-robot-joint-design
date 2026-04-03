@@ -50,49 +50,49 @@ warnings.filterwarnings('ignore')
 # 配置区 —— 根据实际情况调整
 # ============================================================
 CONFIG = {
-    # 降采样步长 (秒)。越小越精确但辨识越慢。
-    # 建议: 首次调试用 5.0, 最终精调用 1.0~2.0
-    'resample_dt': 5.0,
+    'resample_dt': 1,
 
-    # 列名映射: 左边是模型变量名, 右边是CSV列名
-    # 如果你的传感器布局不同, 只需修改这里
     'col_map': {
-        'T1':   'Ch1_Temp_C',      # 节点1温度 (绕组)
-        'T2':   'Ch1_MOS_C',       # 节点2温度 (驱动板MOS)
-        'T3':   'P1.最高温',        # 节点3温度 (外壳红外P1)
-        'Tamb': '图像.最低温',       # 环境温度
-        'I':    'Ch1_Cur_A',       # 相电流 (A)
-        'omega':'Ch1_Spd_rads',    # 角速度 (rad/s)
+        'T1':   'Ch1_Temp_C',
+        'T2':   'Ch1_MOS_C',
+        'T3':   'P1.最高温',
+        'Tamb': '图像.最低温',
+        'I':    'Ch1_Cur_A',
+        'omega':'Ch1_Spd_rads',
     },
 
-    # 时间列名
     'time_col': '系统时间',
     'time_format': '%Y/%m/%d %H:%M:%S.%f',
 
-    # 参数边界 [下限, 上限]
+    'T_ref': 20.0,
+    'lock_speed_thresh': 0.5,
+    'lock_weight': 3.0,
+
     'bounds': {
-        'C1':  (1.0,   300.0),     # 线圈热容 (J/K)
-        'C2':  (0.5,   200.0),     # 驱动板热容 (J/K)
-        'C3':  (1.0,   800.0),     # 外壳热容 (J/K)
-        'R12': (0.05,  30.0),      # 线圈↔驱动板热阻 (K/W)
-        'R13': (0.05,  30.0),      # 线圈↔外壳热阻 (K/W)
-        'R23': (0.1,   50.0),      # 驱动板↔外壳热阻 (K/W)
-        'R2a': (0.1,   50.0),      # 驱动板↔环境热阻 (K/W)
-        'R3a': (0.1,   50.0),      # 外壳↔环境热阻 (K/W)
-        'a':   (0.001, 10.0),      # I² 铜耗系数 (W/A²)
-        'b':   (0.0,   2.0),       # |ω| 铁耗线性项 (W·s/rad)
-        'c':   (0.0,   0.5),       # ω² 铁耗二次项 (W·s²/rad²)
-        'd':   (0.0,   5.0),       # I² 驱动板导通损耗 (W/A²)
-        'e':   (0.0,   5.0),       # |I| 驱动板开关损耗 (W/A)
-        'f':   (0.0,   15.0),      # 驱动板待机损耗 (W)
+        'C1':  (1.0,   300.0),
+        'C2':  (0.5,   200.0),
+        'C3':  (1.0,   800.0),
+        'R12': (0.05,  60.0),
+        'R13': (0.05,  30.0),
+        'R23': (0.1,   50.0),
+        'R2a': (0.1,   50.0),
+        'R3a': (0.1,   50.0),
+        'a':   (0.001, 10.0),
+        'b':   (0.0,   2.0),
+        'c':   (0.0,   0.5),
+        'd':   (0.0,   5.0),
+        'e':   (0.0,   5.0),
+        'f':   (0.0,   15.0),
+        'alpha_w': (0.0, 0.008),
+        'alpha_m': (0.0, 0.010),
     },
 
-    # 差分进化优化设置
-    'de_seeds': [42, 123, 7],      # 多种子并行 (取最优)
-    'de_maxiter': 200,             # 每个种子的最大迭代
-    'de_popsize': 15,              # 种群大小
+    'target_weight_scale': {'T1': 5.0, 'T2': 1.0, 'T3': 1.0},
 
-    # 输出路径
+    'de_seeds': [42, 123, 7],
+    'de_maxiter': 200,
+    'de_popsize': 15,
+
     'output_plot': 'lptn_result.png',
     'output_params': 'lptn_params.csv',
 }
@@ -146,31 +146,37 @@ def load_multiple(csv_paths, config):
 # 2. 正向仿真 (Forward Euler)
 # ============================================================
 def simulate(params, t_data, I_data, omega_data, Tamb_data, T0):
-    """Forward Euler 正向仿真三节点温度"""
-    C1, C2, C3, R12, R13, R23, R2a, R3a, a, b, c, d, e, f = params
+    """Forward Euler 正向仿真三节点温度（温度相关热源版）"""
+    C1, C2, C3, R12, R13, R23, R2a, R3a, a, b, c, d, e, f, alpha_w, alpha_m = params
+    T_ref = CONFIG.get('T_ref', 20.0)
+
     N = len(t_data)
     T_sim = np.zeros((3, N))
     T_sim[:, 0] = T0
 
     for k in range(N - 1):
-        dt = t_data[k+1] - t_data[k]
+        dt = t_data[k + 1] - t_data[k]
         if dt <= 0 or dt > 30:
-            T_sim[:, k+1] = T_sim[:, k]
+            T_sim[:, k + 1] = T_sim[:, k]
             continue
 
         T1, T2, T3 = T_sim[0, k], T_sim[1, k], T_sim[2, k]
         Ik, wk, Ta = I_data[k], omega_data[k], Tamb_data[k]
 
-        P1 = a * Ik**2 + b * abs(wk) + c * wk**2
-        P2 = d * Ik**2 + e * abs(Ik) + f
+        # 温度相关损耗倍率，做 clip 避免优化过程中数值发散
+        k_w = np.clip(1.0 + alpha_w * (T1 - T_ref), 0.5, 2.5)
+        k_m = np.clip(1.0 + alpha_m * (T2 - T_ref), 0.5, 3.0)
 
-        dT1 = (P1 - (T1-T2)/R12 - (T1-T3)/R13) / C1
-        dT2 = (P2 - (T2-T1)/R12 - (T2-T3)/R23 - (T2-Ta)/R2a) / C2
-        dT3 = ((T1-T3)/R13 + (T2-T3)/R23 - (T3-Ta)/R3a) / C3
+        P1 = a * k_w * Ik**2 + b * abs(wk) + c * wk**2
+        P2 = d * k_m * Ik**2 + e * abs(Ik) + f
 
-        T_sim[0, k+1] = T1 + dT1 * dt
-        T_sim[1, k+1] = T2 + dT2 * dt
-        T_sim[2, k+1] = T3 + dT3 * dt
+        dT1 = (P1 - (T1 - T2) / R12 - (T1 - T3) / R13) / C1
+        dT2 = (P2 - (T2 - T1) / R12 - (T2 - T3) / R23 - (T2 - Ta) / R2a) / C2
+        dT3 = ((T1 - T3) / R13 + (T2 - T3) / R23 - (T3 - Ta) / R3a) / C3
+
+        T_sim[0, k + 1] = T1 + dT1 * dt
+        T_sim[1, k + 1] = T2 + dT2 * dt
+        T_sim[2, k + 1] = T3 + dT3 * dt
 
     return t_data, T_sim
 
@@ -179,14 +185,22 @@ def simulate(params, t_data, I_data, omega_data, Tamb_data, T0):
 # 3. 参数辨识
 # ============================================================
 def cost_function(params_vec, t_data, I_data, omega_data, Tamb_data, T_meas, T0, weights):
-    """加权 MSE 目标函数"""
+    """加权 MSE + 堵转段额外加权"""
     try:
         _, T_sim = simulate(params_vec, t_data, I_data, omega_data, Tamb_data, T0)
         if np.any(np.isnan(T_sim)):
             return 1e6
+
         err = 0.0
         for i in range(3):
             err += weights[i] * np.mean((T_sim[i] - T_meas[i])**2)
+
+        # 堵转/近堵转段额外强调 T1
+        lock_mask = np.abs(omega_data) < CONFIG.get('lock_speed_thresh', 0.5)
+        if np.any(lock_mask):
+            lock_weight = CONFIG.get('lock_weight', 0.0)
+            err += lock_weight * weights[0] * np.mean((T_sim[0, lock_mask] - T_meas[0, lock_mask])**2)
+
         return err
     except Exception:
         return 1e6
@@ -205,6 +219,12 @@ def identify_parameters(data, config):
     ranges = [max(T_meas[i].max() - T_meas[i].min(), 1.0) for i in range(3)]
     weights = [1.0 / r**2 for r in ranges]
 
+    scale = config.get('target_weight_scale', {'T1': 1.0, 'T2': 1.0, 'T3': 1.0})
+    weights[0] *= scale['T1']
+    weights[1] *= scale['T2']
+    weights[2] *= scale['T3']
+
+
     print(f"  T1 range: {ranges[0]:.1f}°C, T2 range: {ranges[1]:.1f}°C, T3 range: {ranges[2]:.1f}°C")
 
     bounds_dict = config['bounds']
@@ -214,6 +234,7 @@ def identify_parameters(data, config):
         bounds_dict['R2a'], bounds_dict['R3a'],
         bounds_dict['a'], bounds_dict['b'], bounds_dict['c'],
         bounds_dict['d'], bounds_dict['e'], bounds_dict['f'],
+        bounds_dict['alpha_w'], bounds_dict['alpha_m'],
     ]
 
     best_cost = 1e10
@@ -228,7 +249,7 @@ def identify_parameters(data, config):
             maxiter=config['de_maxiter'],
             tol=1e-8,
             polish=False,
-            workers=1,
+            workers=6,
             disp=False,
             popsize=config['de_popsize'],
             mutation=(0.5, 1.5),
@@ -257,9 +278,9 @@ def identify_parameters(data, config):
 # 4. 结果输出
 # ============================================================
 PARAM_NAMES = ['C1', 'C2', 'C3', 'R12', 'R13', 'R23', 'R2a', 'R3a',
-               'a', 'b', 'c', 'd', 'e', 'f']
+               'a', 'b', 'c', 'd', 'e', 'f', 'alpha_w', 'alpha_m']
 PARAM_UNITS = ['J/K','J/K','J/K','K/W','K/W','K/W','K/W','K/W',
-               'W/A²','W·s/rad','W·s²/rad²','W/A²','W/A','W']
+               'W/A²','W·s/rad','W·s²/rad²','W/A²','W/A','W','1/°C','1/°C']
 PARAM_DESC = [
     'Winding thermal capacitance',
     'Driver thermal capacitance',
@@ -275,6 +296,8 @@ PARAM_DESC = [
     'Driver conduction loss (I²)',
     'Driver switching loss (|I|)',
     'Driver standby loss (const)',
+    'Winding temp coefficient',
+    'MOS temp coefficient',
 ]
 NODE_NAMES = ['Node1 (Winding)', 'Node2 (Driver)', 'Node3 (Shell)']
 NODE_NAMES_CN = ['节点1 (绕组)', '节点2 (驱动板)', '节点3 (外壳)']
@@ -282,20 +305,21 @@ NODE_NAMES_CN = ['节点1 (绕组)', '节点2 (驱动板)', '节点3 (外壳)']
 
 def print_results(params):
     """打印辨识结果和模型方程"""
-    C1, C2, C3, R12, R13, R23, R2a, R3a, a, b, c, d, e, f = params
+    C1, C2, C3, R12, R13, R23, R2a, R3a, a, b, c, d, e, f, alpha_w, alpha_m = params
+    T_ref = CONFIG.get('T_ref', 20.0)
 
     print("\n" + "=" * 60)
     print("IDENTIFIED PARAMETERS")
     print("=" * 60)
     for name, val, unit in zip(PARAM_NAMES, params, PARAM_UNITS):
-        print(f"  {name:6s} = {val:12.6f}  {unit}")
+        print(f"  {name:8s} = {val:12.6f}  {unit}")
 
     print("\n" + "=" * 60)
     print("MODEL EQUATIONS")
     print("=" * 60)
     print(f"""
-  P1 = {a:.4f}·I² + {b:.4f}·|ω| + {c:.6f}·ω²   [W]
-  P2 = {d:.4f}·I² + {e:.4f}·|I| + {f:.4f}          [W]
+  P1 = {a:.4f}·(1 + {alpha_w:.6f}·(T1-{T_ref:.1f}))·I² + {b:.4f}·|ω| + {c:.6f}·ω²   [W]
+  P2 = {d:.4f}·(1 + {alpha_m:.6f}·(T2-{T_ref:.1f}))·I² + {e:.4f}·|I| + {f:.4f}      [W]
 
   {C1:.2f}·dT1/dt = P1 - (T1-T2)/{R12:.4f} - (T1-T3)/{R13:.4f}
   {C2:.2f}·dT2/dt = P2 - (T2-T1)/{R12:.4f} - (T2-T3)/{R23:.4f} - (T2-Tamb)/{R2a:.4f}
@@ -321,8 +345,15 @@ def evaluate_and_plot(params, T0, t, I, omega, Tamb, T_meas, config):
         print(f"  {NODE_NAMES_CN[i]}: RMSE={rmse:.2f}°C, MAE={mae:.2f}°C, MaxErr={maxe:.2f}°C")
 
     # 损耗
-    P1 = params[8]*I**2 + params[9]*np.abs(omega) + params[10]*omega**2
-    P2 = params[11]*I**2 + params[12]*np.abs(I) + params[13]
+    T_ref = CONFIG.get('T_ref', 20.0)
+    alpha_w = params[14]
+    alpha_m = params[15]
+
+    k_w = np.clip(1.0 + alpha_w * (T_sim[0] - T_ref), 0.5, 2.5)
+    k_m = np.clip(1.0 + alpha_m * (T_sim[1] - T_ref), 0.5, 3.0)
+
+    P1 = params[8] * k_w * I**2 + params[9] * np.abs(omega) + params[10] * omega**2
+    P2 = params[11] * k_m * I**2 + params[12] * np.abs(I) + params[13]
 
     # ---- 绘图 ----
     fig, axes = plt.subplots(4, 1, figsize=(14, 16), sharex=True)

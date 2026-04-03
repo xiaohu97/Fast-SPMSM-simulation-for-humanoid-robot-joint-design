@@ -1,15 +1,17 @@
 ﻿Parameter,Value,Unit,Description
-C1,36.59379187219394,J/K,Winding thermal capacitance
-C2,195.77255477133502,J/K,Driver thermal capacitance
-C3,309.5921355798071,J/K,Shell thermal capacitance
-R12,30.0,K/W,Winding↔Driver thermal resistance
-R13,2.077547441354157,K/W,Winding↔Shell thermal resistance
-R23,23.705179059173258,K/W,Driver↔Shell thermal resistance
-R2a,3.628916109897665,K/W,Driver↔Ambient thermal resistance
-R3a,0.7953702986265486,K/W,Shell↔Ambient thermal resistance
-a,0.2738511389545242,W/A²,Copper loss coeff (I²)
-b,1.3998287116790797,W·s/rad,Iron loss coeff (|ω|)
-c,0.0,W·s²/rad²,Iron loss coeff (ω²)
-d,0.1719959549066821,W/A²,Driver conduction loss (I²)
-e,0.8687349749108592,W/A,Driver switching loss (|I|)
-f,0.0,W,Driver standby loss (const)
+C1,27.850190904380128,J/K,Winding thermal capacitance
+C2,191.4888337700229,J/K,Driver thermal capacitance
+C3,393.3272776932651,J/K,Shell thermal capacitance
+R12,58.197342095742485,K/W,Winding↔Driver thermal resistance
+R13,2.030700196293443,K/W,Winding↔Shell thermal resistance
+R23,46.0649375407701,K/W,Driver↔Shell thermal resistance
+R2a,1.624159531436936,K/W,Driver↔Ambient thermal resistance
+R3a,1.029865377077705,K/W,Shell↔Ambient thermal resistance
+a,0.29169319119271536,W/A²,Copper loss coeff (I²)
+b,0.0,W·s/rad,Iron loss coeff (|ω|)
+c,0.09797005442931789,W·s²/rad²,Iron loss coeff (ω²)
+d,0.2810570875646567,W/A²,Driver conduction loss (I²)
+e,0.0,W/A,Driver switching loss (|I|)
+f,12.219028917550782,W,Driver standby loss (const)
+alpha_w,0.0,1/°C,Winding temp coefficient
+alpha_m,0.0,1/°C,MOS temp coefficient
