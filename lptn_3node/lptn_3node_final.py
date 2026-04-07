@@ -1,42 +1,14 @@
 """
-三节点 LPTN / RC 热网络参数辨识工具
-====================================
-适用于: 机器人关节电机 (PMSM) + 一体化驱动板
+三节点 LPTN 热网络参数辨识 (v3.1 - 多阶段 + 铜电阻温度系数)
+==========================================================
+Phase-1: 堵转段 → C1, a_eff, R13 (消除铜损/铁耗退化)
+Phase-2: 全量数据 → 15参数 (C1 + a_lock 固定)
 
-节点定义:
-  节点1: 电机线圈/铁芯  (T1)  ← Ch1_Temp_C   (绕组温度传感器)
-  节点2: 驱动板         (T2)  ← Ch1_MOS_C    (MOS管温度传感器)
-  节点3: 外壳           (T3)  ← P1.最高温     (红外热像仪P1区域)
-  边界:  环境温度       (Tamb) ← 图像.最低温   (红外最低温 ≈ 环境)
-
-热源模型:
-  P1 = a·I² + b·|ω| + c·ω²    (铜耗 + 铁耗/风摩)
-  P2 = d·I² + e·|I| + f        (导通损耗 + 开关损耗 + 待机)
-  P3 ≈ 0                        (外壳无主动热源)
-
-状态方程 (3节点RC网络):
-  C1·dT1/dt = P1 - (T1-T2)/R12 - (T1-T3)/R13
-  C2·dT2/dt = P2 - (T2-T1)/R12 - (T2-T3)/R23 - (T2-Tamb)/R2a
-  C3·dT3/dt =    + (T1-T3)/R13 + (T2-T3)/R23 - (T3-Tamb)/R3a
-
-待辨识参数 (14个):
-  热容:  C1, C2, C3           [J/K]
-  热阻:  R12, R13, R23, R2a, R3a  [K/W]
-  损耗:  a, b, c, d, e, f     [各自单位见下方]
-
-用法:
-  python lptn_3node_final.py <合并CSV文件1> [合并CSV文件2] ...
-
-  若提供多个文件，会按时间顺序拼接后统一辨识。
-  输入CSV需要包含以下列:
-    系统时间, Ch1_Temp_C, Ch1_MOS_C, Ch1_Cur_A, Ch1_Spd_rads,
-    P1.最高温, 图像.最低温
-
-示例:
-  python lptn_3node_final.py merged_data_2.csv merged_data-2.csv
+铜损温度系数: P_cu = a·(1 + α_cu·(ΔT))·I²
+用法:  python lptn_3node_final.py <CSV1> [CSV2] ...
 """
 
-import sys
+import sys, time
 import numpy as np
 import pandas as pd
 from scipy.optimize import differential_evolution, minimize
@@ -47,80 +19,64 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================================
-# 配置区 —— 根据实际情况调整
+# 配置
 # ============================================================
 CONFIG = {
     'resample_dt': 1,
-
     'col_map': {
-        'T1':   'Ch1_Temp_C',
-        'T2':   'Ch1_MOS_C',
-        'T3':   'P1.最高温',
-        'Tamb': '图像.最低温',
-        'I':    'Ch1_Cur_A',
-        'omega':'Ch1_Spd_rads',
+        'T1': 'Ch1_Temp_C', 'T2': 'Ch1_MOS_C',
+        'T3': 'P1.最高温', 'Tamb': '图像.最低温',
+        'I': 'Ch1_Cur_A', 'omega': 'Ch1_Spd_rads',
     },
-
     'time_col': '系统时间',
     'time_format': '%Y/%m/%d %H:%M:%S.%f',
 
-    'T_ref': 20.0,
     'lock_speed_thresh': 0.5,
-    'lock_weight': 3.0,
+    'lock_weight': 5.0,
+    'deriv_weight': 0.5,
+    'rising_weight': 2.0,
 
     'bounds': {
-        'C1':  (1.0,   300.0),
-        'C2':  (0.5,   200.0),
-        'C3':  (1.0,   800.0),
-        'R12': (0.05,  60.0),
-        'R13': (0.05,  30.0),
-        'R23': (0.1,   50.0),
-        'R2a': (0.1,   50.0),
-        'R3a': (0.1,   50.0),
-        'a':   (0.001, 10.0),
-        'b':   (0.0,   2.0),
-        'c':   (0.0,   0.5),
-        'd':   (0.0,   5.0),
-        'e':   (0.0,   5.0),
-        'f':   (0.0,   15.0),
-        'alpha_w': (0.0, 0.008),
-        'alpha_m': (0.0, 0.010),
+        'C1': (5, 500), 'C2': (1, 400), 'C3': (5, 1500),
+        'R12': (0.1, 100), 'R13': (0.1, 50), 'R23': (0.1, 100),
+        'R2a': (0.5, 80), 'R3a': (0.1, 50),
+        'a': (0.05, 15), 'b': (0, 2), 'c': (0, 0.5),
+        'd': (0, 5), 'e': (0, 5), 'f': (0, 5),
+        'a_lock': (0, 15), 'd_lock': (0, 5), 'omega0': (0.1, 10),
     },
 
     'target_weight_scale': {'T1': 5.0, 'T2': 1.0, 'T3': 1.0},
+
+    'phase1_de_seeds': [42, 123, 7],
+    'phase1_de_maxiter': 150,
+    'phase1_de_popsize': 12,
 
     'de_seeds': [42, 123, 7],
     'de_maxiter': 200,
     'de_popsize': 15,
 
+    # ── 铜电阻温度系数 (固定物理常数) ──
+    'alpha_cu': 0.00393,   # 铜电阻温度系数 [1/°C]
+    'T_ref': 25.0,         # 参考温度 [°C]
+
     'output_plot': 'lptn_result.png',
     'output_params': 'lptn_params.csv',
 }
 
-
 # ============================================================
-# 1. 数据加载与预处理
+# 数据加载
 # ============================================================
 def load_and_preprocess(csv_path, config):
-    """加载合并后的CSV，提取热模型所需列，降采样"""
     df = pd.read_csv(csv_path, encoding='utf-8-sig')
-    df['timestamp'] = pd.to_datetime(
-        df[config['time_col']], format=config['time_format']
-    )
-    t0 = df['timestamp'].iloc[0]
-    df['t_sec'] = (df['timestamp'] - t0).dt.total_seconds()
-
+    df['timestamp'] = pd.to_datetime(df[config['time_col']], format=config['time_format'])
+    df['t_sec'] = (df['timestamp'] - df['timestamp'].iloc[0]).dt.total_seconds()
     cm = config['col_map']
     data = pd.DataFrame({
-        't':    df['t_sec'],
-        'T1':   df[cm['T1']].astype(float),
-        'T2':   df[cm['T2']].astype(float),
-        'T3':   df[cm['T3']].astype(float),
-        'Tamb': df[cm['Tamb']].astype(float),
-        'I':    df[cm['I']].astype(float),
-        'omega':df[cm['omega']].astype(float),
+        't': df['t_sec'], 'T1': df[cm['T1']].astype(float),
+        'T2': df[cm['T2']].astype(float), 'T3': df[cm['T3']].astype(float),
+        'Tamb': df[cm['Tamb']].astype(float), 'I': df[cm['I']].astype(float),
+        'omega': df[cm['omega']].astype(float),
     })
-
     dt = config['resample_dt']
     data['t_bin'] = (data['t'] / dt).astype(int) * dt
     data_rs = data.groupby('t_bin').mean().reset_index()
@@ -128,314 +84,455 @@ def load_and_preprocess(csv_path, config):
     data_rs.drop(columns=['t_bin'], inplace=True)
     return data_rs
 
-
 def load_multiple(csv_paths, config):
-    """加载并拼接多个数据集"""
     dfs = []
     for path in csv_paths:
         d = load_and_preprocess(path, config)
         if dfs:
-            gap = 5.0
-            d['t'] = d['t'] + dfs[-1]['t'].max() + gap
+            d['t'] = d['t'] + dfs[-1]['t'].max() + 5.0
         dfs.append(d)
-    combined = pd.concat(dfs, ignore_index=True)
-    return combined
+    return pd.concat(dfs, ignore_index=True)
 
 
 # ============================================================
-# 2. 正向仿真 (Forward Euler)
+# 高速仿真: 预计算 + 向量化 Euler
 # ============================================================
-def simulate(params, t_data, I_data, omega_data, Tamb_data, T0):
-    """Forward Euler 正向仿真三节点温度（温度相关热源版）"""
-    C1, C2, C3, R12, R13, R23, R2a, R3a, a, b, c, d, e, f, alpha_w, alpha_m = params
-    T_ref = CONFIG.get('T_ref', 20.0)
+class SimContext:
+    """预计算所有不依赖参数的量, 减少每次仿真的开销"""
+    def __init__(self, t, I, omega, Tamb, T0, T_meas, config, a_eff=None, C1_fixed=None):
+        self.N = len(t)
+        self.dt = np.diff(t)  # (N-1,)
+        self.I = I.copy()
+        self.I2 = I ** 2
+        self.I_abs = np.abs(I)
+        self.omega_abs = np.abs(omega)
+        self.omega2 = omega ** 2
+        self.Tamb = Tamb.copy()
+        self.T0 = np.array(T0, dtype=np.float64)
+        self.T_meas = T_meas.copy()  # (3, N)
+        self.a_eff = a_eff      # 硬约束: a + a_lock = a_eff
+        self.C1_fixed = C1_fixed  # 硬约束: C1 固定为 Phase-1 值
 
-    N = len(t_data)
-    T_sim = np.zeros((3, N))
-    T_sim[:, 0] = T0
+        # 预计算掩码
+        self.lock_mask = self.omega_abs < config.get('lock_speed_thresh', 0.5)
+        self.n_lock = np.sum(self.lock_mask)
+
+        # 预计算导数相关
+        self.dt_safe = np.where(self.dt > 0, self.dt, 1.0)
+        self.dT_meas = np.diff(T_meas, axis=1) / self.dt_safe[np.newaxis, :]  # (3, N-1)
+
+        # 温升掩码
+        rising = self.dT_meas[0] > 0.05
+        self.rising_mask = rising
+        self.n_rising = np.sum(rising)
+
+        # 权重
+        ranges = [max(T_meas[i].max() - T_meas[i].min(), 1.0) for i in range(3)]
+        weights = [1.0 / r**2 for r in ranges]
+        scale = config.get('target_weight_scale', {'T1': 1, 'T2': 1, 'T3': 1})
+        self.weights = np.array([weights[0]*scale['T1'], weights[1]*scale['T2'], weights[2]*scale['T3']])
+        self.lock_weight = config.get('lock_weight', 5.0)
+        self.deriv_weight = config.get('deriv_weight', 0.5)
+        self.rising_weight = config.get('rising_weight', 2.0)
+
+        # 有效dt掩码 (跳过异常间隔)
+        self.valid = (self.dt > 0) & (self.dt <= 30)
+
+        # 铜电阻温度系数
+        self.alpha_cu = config.get('alpha_cu', 0.00393)
+        self.T_ref = config.get('T_ref', 25.0)
+
+
+# Phase-2 优化参数顺序 (15个, 不含 C1 和 a_lock):
+# C2, C3, R12, R13, R23, R2a, R3a, a, b, c, d, e, f, d_lock, omega0
+P2_PARAM_NAMES = ['C2','C3','R12','R13','R23','R2a','R3a',
+                  'a','b','c','d','e','f','d_lock','omega0']
+
+def _expand_params(p15, a_eff, C1_fixed):
+    """将15参数 + a_eff + C1 展开为完整17参数"""
+    # p15: C2, C3, R12, R13, R23, R2a, R3a, a, b, c, d, e, f, d_lock, omega0
+    a = p15[7]  # a is at index 7 in p15
+    a_lock = max(a_eff - a, 0.0)
+    # 完整17: C1, C2, C3, R12, R13, R23, R2a, R3a, a, b, c, d, e, f, a_lock, d_lock, omega0
+    return np.array([C1_fixed, *p15[:13], a_lock, p15[13], p15[14]])
+
+
+def simulate_fast(params17, ctx):
+    """Forward Euler - 接受完整17参数, 铜损含温度系数"""
+    C1, C2, C3, R12, R13, R23, R2a, R3a = params17[:8]
+    a, b, c, d_, e, f, a_lock, d_lock, omega0 = params17[8:]
+
+    N = ctx.N
+    T1 = np.empty(N)
+    T2 = np.empty(N)
+    T3 = np.empty(N)
+    T1[0], T2[0], T3[0] = ctx.T0
+
+    omega0_eff = max(omega0, 1e-6)
+    s_lock = np.exp(-(ctx.omega_abs / omega0_eff) ** 2)
+
+    # 铜损系数 (不含温度修正, 每步乘以温度因子)
+    a_eff_arr = (a + a_lock * s_lock)  # (N,)
+    # 铁耗 (不依赖温度, 可预计算)
+    P1_iron = b * ctx.omega_abs + c * ctx.omega2
+    # 驱动板损耗 (不依赖温度)
+    P2_all = (d_ + d_lock * s_lock) * ctx.I2 + e * ctx.I_abs + f
+
+    inv_C1 = 1.0 / C1
+    inv_C2 = 1.0 / C2
+    inv_C3 = 1.0 / C3
+    inv_R12 = 1.0 / R12
+    inv_R13 = 1.0 / R13
+    inv_R23 = 1.0 / R23
+    inv_R2a = 1.0 / R2a
+    inv_R3a = 1.0 / R3a
+    alpha_cu = ctx.alpha_cu
+    T_ref = ctx.T_ref
+
+    dt_arr = ctx.dt
+    valid = ctx.valid
+    Ta = ctx.Tamb
+    I2 = ctx.I2
 
     for k in range(N - 1):
-        dt = t_data[k + 1] - t_data[k]
-        if dt <= 0 or dt > 30:
-            T_sim[:, k + 1] = T_sim[:, k]
+        if not valid[k]:
+            T1[k+1] = T1[k]; T2[k+1] = T2[k]; T3[k+1] = T3[k]
             continue
+        t1, t2, t3 = T1[k], T2[k], T3[k]
+        dt = dt_arr[k]
+        # 铜损: a_eff · (1 + α · (T1 - T_ref)) · I²
+        P1_cu = a_eff_arr[k] * (1.0 + alpha_cu * (t1 - T_ref)) * I2[k]
+        P1 = P1_cu + P1_iron[k]
+        dT1 = (P1 - (t1-t2)*inv_R12 - (t1-t3)*inv_R13) * inv_C1
+        dT2 = (P2_all[k] - (t2-t1)*inv_R12 - (t2-t3)*inv_R23 - (t2-Ta[k])*inv_R2a) * inv_C2
+        dT3 = ((t1-t3)*inv_R13 + (t2-t3)*inv_R23 - (t3-Ta[k])*inv_R3a) * inv_C3
+        T1[k+1] = t1 + dT1 * dt
+        T2[k+1] = t2 + dT2 * dt
+        T3[k+1] = t3 + dT3 * dt
 
-        T1, T2, T3 = T_sim[0, k], T_sim[1, k], T_sim[2, k]
-        Ik, wk, Ta = I_data[k], omega_data[k], Tamb_data[k]
-
-        # 温度相关损耗倍率，做 clip 避免优化过程中数值发散
-        k_w = np.clip(1.0 + alpha_w * (T1 - T_ref), 0.5, 2.5)
-        k_m = np.clip(1.0 + alpha_m * (T2 - T_ref), 0.5, 3.0)
-
-        P1 = a * k_w * Ik**2 + b * abs(wk) + c * wk**2
-        P2 = d * k_m * Ik**2 + e * abs(Ik) + f
-
-        dT1 = (P1 - (T1 - T2) / R12 - (T1 - T3) / R13) / C1
-        dT2 = (P2 - (T2 - T1) / R12 - (T2 - T3) / R23 - (T2 - Ta) / R2a) / C2
-        dT3 = ((T1 - T3) / R13 + (T2 - T3) / R23 - (T3 - Ta) / R3a) / C3
-
-        T_sim[0, k + 1] = T1 + dT1 * dt
-        T_sim[1, k + 1] = T2 + dT2 * dt
-        T_sim[2, k + 1] = T3 + dT3 * dt
-
-    return t_data, T_sim
+    return np.array([T1, T2, T3])
 
 
-# ============================================================
-# 3. 参数辨识
-# ============================================================
-def cost_function(params_vec, t_data, I_data, omega_data, Tamb_data, T_meas, T0, weights):
-    """加权 MSE + 堵转段额外加权"""
+def cost_fast(p15, ctx):
+    """高速代价函数 — 15参数 + C1/a_eff硬约束"""
     try:
-        _, T_sim = simulate(params_vec, t_data, I_data, omega_data, Tamb_data, T0)
-        if np.any(np.isnan(T_sim)):
+        params17 = _expand_params(p15, ctx.a_eff, ctx.C1_fixed)
+        T_sim = simulate_fast(params17, ctx)
+        if np.any(np.isnan(T_sim)) or np.any(np.abs(T_sim) > 500):
             return 1e6
 
+        w = ctx.weights
         err = 0.0
-        for i in range(3):
-            err += weights[i] * np.mean((T_sim[i] - T_meas[i])**2)
 
-        # 堵转/近堵转段额外强调 T1
-        lock_mask = np.abs(omega_data) < CONFIG.get('lock_speed_thresh', 0.5)
-        if np.any(lock_mask):
-            lock_weight = CONFIG.get('lock_weight', 0.0)
-            err += lock_weight * weights[0] * np.mean((T_sim[0, lock_mask] - T_meas[0, lock_mask])**2)
+        # 基本 MSE
+        for i in range(3):
+            err += w[i] * np.mean((T_sim[i] - ctx.T_meas[i]) ** 2)
+
+        # 堵转加权 (全节点)
+        if ctx.n_lock > 0:
+            lm = ctx.lock_mask
+            for i in range(3):
+                err += ctx.lock_weight * w[i] * np.mean((T_sim[i, lm] - ctx.T_meas[i, lm]) ** 2)
+
+        # 导数误差
+        if ctx.deriv_weight > 0:
+            dT_sim = np.diff(T_sim, axis=1) / ctx.dt_safe[np.newaxis, :]
+            for i in range(3):
+                err += ctx.deriv_weight * w[i] * np.mean((dT_sim[i] - ctx.dT_meas[i]) ** 2)
+
+        # 温升加权
+        if ctx.rising_weight > 0 and ctx.n_rising > 0:
+            rm = ctx.rising_mask
+            err += ctx.rising_weight * w[0] * np.mean((T_sim[0, 1:][rm] - ctx.T_meas[0, 1:][rm]) ** 2)
 
         return err
     except Exception:
         return 1e6
 
 
-def identify_parameters(data, config):
-    """差分进化 + L-BFGS-B 多种子辨识"""
-    t = data['t'].values
-    I = data['I'].values
+# ============================================================
+# Phase-1: 堵转段单节点辨识
+# ============================================================
+def run_phase1(data, config):
     omega = data['omega'].values
-    Tamb = data['Tamb'].values
+    lock_mask = np.abs(omega) < config.get('lock_speed_thresh', 0.5)
+    if np.sum(lock_mask) < 10:
+        print("  Phase-1: 堵转数据不足, 跳过")
+        return None
+
+    d_lock = data[lock_mask].reset_index(drop=True)
+    t = d_lock['t'].values
+    I = d_lock['I'].values
+    T1 = d_lock['T1'].values
+    T3 = d_lock['T3'].values
+    I2 = I ** 2
+    dt_arr = np.diff(t)
+    dt_safe = np.where(dt_arr > 0, dt_arr, 1.0)
+    valid = (dt_arr > 0) & (dt_arr <= 30)
+    dT1_meas = np.diff(T1) / dt_safe
+
+    print(f"  Phase-1 data: {len(d_lock)} pts, {t[-1]-t[0]:.0f}s")
+    print(f"    I_rms={np.sqrt(np.mean(I2)):.2f}A, T1: {T1[0]:.1f}→{T1[-1]:.1f}°C (range={T1.max()-T1.min():.1f}°C)")
+
+    def p1_sim(C1, a_eff, R13):
+        N = len(t)
+        T1s = np.empty(N); T1s[0] = T1[0]
+        inv_C1 = 1.0/C1; inv_R13 = 1.0/R13
+        alpha_cu = config.get('alpha_cu', 0.00393)
+        T_ref = config.get('T_ref', 25.0)
+        for k in range(N-1):
+            if not valid[k]:
+                T1s[k+1] = T1s[k]; continue
+            # 铜损含温度系数: a_eff · (1 + α · (T1 - T_ref)) · I²
+            P = a_eff * (1.0 + alpha_cu * (T1s[k] - T_ref)) * I2[k]
+            dT = (P - (T1s[k]-T3[k])*inv_R13) * inv_C1
+            T1s[k+1] = T1s[k] + dT * dt_arr[k]
+        return T1s
+
+    def p1_cost(pvec):
+        C1, a_eff, R13 = pvec
+        try:
+            T1s = p1_sim(C1, a_eff, R13)
+            if np.any(np.isnan(T1s)): return 1e6
+            mse = np.mean((T1s - T1)**2)
+            dT1s = np.diff(T1s) / dt_safe
+            deriv = np.mean((dT1s - dT1_meas)**2)
+            return mse + 0.5 * deriv
+        except: return 1e6
+
+    bounds_p1 = [(5, 500), (0.1, 20), (0.1, 50)]
+    best_c, best_x = 1e10, None
+    for seed in config.get('phase1_de_seeds', [42, 123, 7]):
+        print(f"    DE-P1 (seed={seed})...", end=' ', flush=True)
+        t0s = time.time()
+        r = differential_evolution(p1_cost, bounds_p1, seed=seed,
+            maxiter=config.get('phase1_de_maxiter', 150),
+            popsize=config.get('phase1_de_popsize', 12),
+            tol=1e-9, polish=False, workers=1)
+        r2 = minimize(p1_cost, r.x, method='L-BFGS-B', bounds=bounds_p1,
+            options={'maxiter': 300, 'ftol': 1e-14})
+        print(f"cost={r2.fun:.4f} ({time.time()-t0s:.0f}s)")
+        if r2.fun < best_c:
+            best_c, best_x = r2.fun, r2.x
+
+    C1, a_eff, R13 = best_x
+    T1s = p1_sim(C1, a_eff, R13)
+    rmse = np.sqrt(np.mean((T1s - T1)**2))
+    print(f"\n  Phase-1 results:")
+    print(f"    C1={C1:.2f} J/K, a_eff={a_eff:.4f} W/A²(@{config.get('T_ref',25)}°C), R13={R13:.4f} K/W")
+    print(f"    α_cu={config.get('alpha_cu',0.00393):.5f} /°C (P_cu∝(1+α·ΔT))")
+    print(f"    Fit: RMSE={rmse:.2f}°C, MaxErr={np.max(np.abs(T1s-T1)):.2f}°C")
+    return {'C1': C1, 'a_eff': a_eff, 'R13': R13}
+
+
+# ============================================================
+# Phase-2: 全量辨识 (16参数, a_lock = a_eff - a 硬约束)
+# ============================================================
+FULL_PARAM_NAMES = ['C1','C2','C3','R12','R13','R23','R2a','R3a',
+                    'a','b','c','d','e','f','a_lock','d_lock','omega0']
+
+def identify_parameters(data, config, p1=None):
+    t = data['t'].values; I = data['I'].values
+    omega = data['omega'].values; Tamb = data['Tamb'].values
     T_meas = np.array([data['T1'].values, data['T2'].values, data['T3'].values])
-    T0 = [T_meas[0, 0], T_meas[1, 0], T_meas[2, 0]]
+    T0 = [T_meas[0,0], T_meas[1,0], T_meas[2,0]]
 
-    # 归一化权重
-    ranges = [max(T_meas[i].max() - T_meas[i].min(), 1.0) for i in range(3)]
-    weights = [1.0 / r**2 for r in ranges]
+    a_eff = p1['a_eff'] if p1 else 1.0
+    C1_fixed = p1['C1'] if p1 else 50.0
+    ctx = SimContext(t, I, omega, Tamb, T0, T_meas, config, a_eff=a_eff, C1_fixed=C1_fixed)
 
-    scale = config.get('target_weight_scale', {'T1': 1.0, 'T2': 1.0, 'T3': 1.0})
-    weights[0] *= scale['T1']
-    weights[1] *= scale['T2']
-    weights[2] *= scale['T3']
+    bd = dict(config['bounds'])
+    if p1:
+        R13_p1 = p1['R13']
+        bd['R13'] = (max(R13_p1*0.5, 0.1), R13_p1*1.5)
+        bd['a'] = (0.05, a_eff)
+        print(f"\n  Phase-1 硬约束:")
+        print(f"    C1 = {C1_fixed:.2f} J/K (FIXED)")
+        print(f"    a + a_lock = {a_eff:.4f} W/A² (FIXED)")
+        print(f"    R13:[{bd['R13'][0]:.3f},{bd['R13'][1]:.3f}] (Phase-1参考值: {R13_p1:.3f}, 自由辨识)")
+        print(f"    a:[{bd['a'][0]:.3f},{bd['a'][1]:.3f}] → a_lock=[{a_eff-bd['a'][1]:.3f},{a_eff-bd['a'][0]:.3f}]")
 
+    # 15参数边界 (无 C1, 无 a_lock)
+    bounds_list = [bd[n] for n in P2_PARAM_NAMES]
 
-    print(f"  T1 range: {ranges[0]:.1f}°C, T2 range: {ranges[1]:.1f}°C, T3 range: {ranges[2]:.1f}°C")
+    best_cost, best_x15 = 1e10, None
+    for seed in config['de_seeds']:
+        print(f"\n  DE (seed={seed})...", end=' ', flush=True)
+        t0s = time.time()
+        r = differential_evolution(cost_fast, bounds_list,
+            args=(ctx,), seed=seed,
+            maxiter=config['de_maxiter'], popsize=config['de_popsize'],
+            tol=1e-8, polish=False, workers=1,
+            mutation=(0.5,1.5), recombination=0.9)
+        print(f"cost={r.fun:.6f} ({time.time()-t0s:.0f}s)", end=' → ', flush=True)
 
-    bounds_dict = config['bounds']
-    bounds_list = [
-        bounds_dict['C1'], bounds_dict['C2'], bounds_dict['C3'],
-        bounds_dict['R12'], bounds_dict['R13'], bounds_dict['R23'],
-        bounds_dict['R2a'], bounds_dict['R3a'],
-        bounds_dict['a'], bounds_dict['b'], bounds_dict['c'],
-        bounds_dict['d'], bounds_dict['e'], bounds_dict['f'],
-        bounds_dict['alpha_w'], bounds_dict['alpha_m'],
-    ]
+        r2 = minimize(cost_fast, r.x, args=(ctx,),
+            method='L-BFGS-B', bounds=bounds_list,
+            options={'maxiter': 500, 'ftol': 1e-12})
+        print(f"refined={r2.fun:.6f}")
 
-    best_cost = 1e10
-    best_x = None
-
-    for seed_val in config['de_seeds']:
-        print(f"\n  DE (seed={seed_val})...", end=' ')
-        result_de = differential_evolution(
-            cost_function, bounds_list,
-            args=(t, I, omega, Tamb, T_meas, T0, weights),
-            seed=seed_val,
-            maxiter=config['de_maxiter'],
-            tol=1e-8,
-            polish=False,
-            workers=6,
-            disp=False,
-            popsize=config['de_popsize'],
-            mutation=(0.5, 1.5),
-            recombination=0.9,
-        )
-        print(f"cost={result_de.fun:.6f}", end=' → ')
-
-        result_lb = minimize(
-            cost_function, result_de.x,
-            args=(t, I, omega, Tamb, T_meas, T0, weights),
-            method='L-BFGS-B',
-            bounds=bounds_list,
-            options={'maxiter': 500, 'ftol': 1e-12},
-        )
-        print(f"refined={result_lb.fun:.6f}")
-
-        if result_lb.fun < best_cost:
-            best_cost = result_lb.fun
-            best_x = result_lb.x
+        if r2.fun < best_cost:
+            best_cost, best_x15 = r2.fun, r2.x
 
     print(f"\n  Best cost: {best_cost:.6f}")
-    return best_x, T0, t, I, omega, Tamb, T_meas
+
+    # 展开为17参数
+    best_x17 = _expand_params(best_x15, a_eff, C1_fixed)
+
+    # 碰界 (对15参数检查)
+    print("  碰界检查:")
+    hit = False
+    for i,(name,(lo,hi)) in enumerate(zip(P2_PARAM_NAMES, bounds_list)):
+        v = best_x15[i]; m = 1e-4*(hi-lo)
+        if abs(v-lo)<m:
+            print(f"    ⚠ {name}={v:.4f} 碰下界({lo})")
+            hit = True
+        elif abs(v-hi)<m:
+            print(f"    ⚠ {name}={v:.4f} 碰上界({hi})")
+            hit = True
+    if not hit: print("    ✓ 全部在界内")
+
+    a_val = best_x17[8]; a_lock_val = best_x17[14]
+    print(f"  硬约束验证: C1={C1_fixed:.2f}(FIXED)  a={a_val:.4f}+a_lock={a_lock_val:.4f}={a_val+a_lock_val:.4f}(≡{a_eff:.4f})")
+
+    return best_x17, T0, t, I, omega, Tamb, T_meas, ctx
 
 
 # ============================================================
-# 4. 结果输出
+# 输出
 # ============================================================
-PARAM_NAMES = ['C1', 'C2', 'C3', 'R12', 'R13', 'R23', 'R2a', 'R3a',
-               'a', 'b', 'c', 'd', 'e', 'f', 'alpha_w', 'alpha_m']
 PARAM_UNITS = ['J/K','J/K','J/K','K/W','K/W','K/W','K/W','K/W',
-               'W/A²','W·s/rad','W·s²/rad²','W/A²','W/A','W','1/°C','1/°C']
+               'W/A²','W·s/rad','W·s²/rad²','W/A²','W/A','W','W/A²','W/A²','rad/s']
 PARAM_DESC = [
-    'Winding thermal capacitance',
-    'Driver thermal capacitance',
-    'Shell thermal capacitance',
-    'Winding↔Driver thermal resistance',
-    'Winding↔Shell thermal resistance',
-    'Driver↔Shell thermal resistance',
-    'Driver↔Ambient thermal resistance',
-    'Shell↔Ambient thermal resistance',
-    'Copper loss coeff (I²)',
-    'Iron loss coeff (|ω|)',
-    'Iron loss coeff (ω²)',
-    'Driver conduction loss (I²)',
-    'Driver switching loss (|I|)',
-    'Driver standby loss (const)',
-    'Winding temp coefficient',
-    'MOS temp coefficient',
+    'Winding thermal capacitance','Driver thermal capacitance','Shell thermal capacitance',
+    'Winding-Driver resistance','Winding-Shell resistance','Driver-Shell resistance',
+    'Driver-Ambient resistance','Shell-Ambient resistance',
+    'Copper loss (I², running)','Iron loss (|ω|)','Iron loss (ω²)',
+    'Driver conduction (I²)','Driver switching (|I|)','Driver standby',
+    'Locked-rotor extra motor (FIXED)','Locked-rotor extra driver','Lock decay speed',
 ]
-NODE_NAMES = ['Node1 (Winding)', 'Node2 (Driver)', 'Node3 (Shell)']
-NODE_NAMES_CN = ['节点1 (绕组)', '节点2 (驱动板)', '节点3 (外壳)']
+NODE_CN = ['节点1(绕组)', '节点2(驱动板)', '节点3(外壳)']
 
 
-def print_results(params):
-    """打印辨识结果和模型方程"""
-    C1, C2, C3, R12, R13, R23, R2a, R3a, a, b, c, d, e, f, alpha_w, alpha_m = params
-    T_ref = CONFIG.get('T_ref', 20.0)
-
-    print("\n" + "=" * 60)
-    print("IDENTIFIED PARAMETERS")
-    print("=" * 60)
-    for name, val, unit in zip(PARAM_NAMES, params, PARAM_UNITS):
-        print(f"  {name:8s} = {val:12.6f}  {unit}")
-
-    print("\n" + "=" * 60)
-    print("MODEL EQUATIONS")
-    print("=" * 60)
+def print_results(params, config=None):
+    if config is None: config = CONFIG
+    C1,C2,C3,R12,R13,R23,R2a,R3a,a,b,c,d,e,f,a_lock,d_lock,omega0 = params
+    print("\n" + "="*60 + "\nIDENTIFIED PARAMETERS\n" + "="*60)
+    for n,v,u in zip(FULL_PARAM_NAMES, params, PARAM_UNITS):
+        print(f"  {n:8s} = {v:12.6f}  {u}")
     print(f"""
-  P1 = {a:.4f}·(1 + {alpha_w:.6f}·(T1-{T_ref:.1f}))·I² + {b:.4f}·|ω| + {c:.6f}·ω²   [W]
-  P2 = {d:.4f}·(1 + {alpha_m:.6f}·(T2-{T_ref:.1f}))·I² + {e:.4f}·|I| + {f:.4f}      [W]
-
-  {C1:.2f}·dT1/dt = P1 - (T1-T2)/{R12:.4f} - (T1-T3)/{R13:.4f}
-  {C2:.2f}·dT2/dt = P2 - (T2-T1)/{R12:.4f} - (T2-T3)/{R23:.4f} - (T2-Tamb)/{R2a:.4f}
-  {C3:.2f}·dT3/dt =    + (T1-T3)/{R13:.4f} + (T2-T3)/{R23:.4f} - (T3-Tamb)/{R3a:.4f}
-
-  Time constants:
-    τ1 ≈ {C1 * (1/(1/R12 + 1/R13)):.1f} s   (winding)
-    τ2 ≈ {C2 * (1/(1/R12 + 1/R23 + 1/R2a)):.1f} s   (driver)
-    τ3 ≈ {C3 * (1/(1/R13 + 1/R23 + 1/R3a)):.1f} s   (shell)
-""")
+  s(ω) = exp(-(|ω|/{omega0:.4f})²)
+  P1 = ({a:.4f}+{a_lock:.4f}·s)·(1+{config.get('alpha_cu',0.00393):.5f}·(T1-{config.get('T_ref',25)}))·I² + {b:.4f}·|ω| + {c:.6f}·ω²
+  P2 = ({d:.4f}+{d_lock:.4f}·s)·I² + {e:.4f}·|I| + {f:.4f}
+  τ1≈{C1*(1/(1/R12+1/R13)):.1f}s  τ2≈{C2*(1/(1/R12+1/R23+1/R2a)):.1f}s  τ3≈{C3*(1/(1/R13+1/R23+1/R3a)):.1f}s""")
 
 
 def evaluate_and_plot(params, T0, t, I, omega, Tamb, T_meas, config):
-    """仿真对比 + 绘图 + 保存参数"""
-    _, T_sim = simulate(params, t, I, omega, Tamb, T0)
+    T_sim = simulate_fast(params, SimContext(t, I, omega, Tamb, T0, T_meas, config))
 
-    print("FITTING ACCURACY")
-    print("-" * 40)
+    print("\nFITTING ACCURACY\n" + "-"*50)
     for i in range(3):
-        rmse = np.sqrt(np.mean((T_sim[i] - T_meas[i])**2))
-        mae = np.mean(np.abs(T_sim[i] - T_meas[i]))
-        maxe = np.max(np.abs(T_sim[i] - T_meas[i]))
-        print(f"  {NODE_NAMES_CN[i]}: RMSE={rmse:.2f}°C, MAE={mae:.2f}°C, MaxErr={maxe:.2f}°C")
+        rmse = np.sqrt(np.mean((T_sim[i]-T_meas[i])**2))
+        mae = np.mean(np.abs(T_sim[i]-T_meas[i]))
+        maxe = np.max(np.abs(T_sim[i]-T_meas[i]))
+        print(f"  {NODE_CN[i]}: RMSE={rmse:.2f}°C, MAE={mae:.2f}°C, MaxErr={maxe:.2f}°C")
 
-    # 损耗
-    T_ref = CONFIG.get('T_ref', 20.0)
-    alpha_w = params[14]
-    alpha_m = params[15]
+    lock_mask = np.abs(omega) < config.get('lock_speed_thresh', 0.5)
+    if np.any(lock_mask):
+        print("  ── 堵转段 ──")
+        for i in range(3):
+            r = np.sqrt(np.mean((T_sim[i,lock_mask]-T_meas[i,lock_mask])**2))
+            m = np.max(np.abs(T_sim[i,lock_mask]-T_meas[i,lock_mask]))
+            print(f"    {NODE_CN[i]}: RMSE={r:.2f}°C, MaxErr={m:.2f}°C")
 
-    k_w = np.clip(1.0 + alpha_w * (T_sim[0] - T_ref), 0.5, 2.5)
-    k_m = np.clip(1.0 + alpha_m * (T_sim[1] - T_ref), 0.5, 3.0)
+    a,b,c = params[8:11]; d_,e,f = params[11:14]
+    a_lock,d_lock,omega0 = params[14:17]
+    alpha_cu = config.get('alpha_cu', 0.00393)
+    T_ref = config.get('T_ref', 25.0)
+    s = np.exp(-(np.abs(omega)/max(omega0,1e-6))**2)
+    a_eff_arr = a + a_lock * s
+    # 铜损用T_sim[0] (T1) 计算温度修正
+    P1 = a_eff_arr * (1.0 + alpha_cu * (T_sim[0] - T_ref)) * I**2 + b*np.abs(omega) + c*omega**2
+    P2 = (d_+d_lock*s)*I**2 + e*np.abs(I) + f
 
-    P1 = params[8] * k_w * I**2 + params[9] * np.abs(omega) + params[10] * omega**2
-    P2 = params[11] * k_m * I**2 + params[12] * np.abs(I) + params[13]
-
-    # ---- 绘图 ----
-    fig, axes = plt.subplots(4, 1, figsize=(14, 16), sharex=True)
-    colors_m = ['#e74c3c', '#3498db', '#2ecc71']
-    colors_s = ['#c0392b', '#2980b9', '#27ae60']
-
-    titles = ['Node 1: Winding / Iron Core',
-              'Node 2: Driver Board (MOS)',
-              'Node 3: Shell / Housing']
-    labels_m = ['T1 measured (winding)', 'T2 measured (driver MOS)', 'T3 measured (shell IR)']
+    fig, axes = plt.subplots(5, 1, figsize=(14,20), sharex=True,
+                             gridspec_kw={'height_ratios':[3,3,3,2,2]})
+    cm = ['#e74c3c','#3498db','#2ecc71']
+    cs = ['#c0392b','#2980b9','#27ae60']
+    titles = ['Node 1: Winding','Node 2: Driver (MOS)','Node 3: Shell']
+    lm = ['T1 meas','T2 meas','T3 meas']
 
     for i in range(3):
         ax = axes[i]
-        rmse = np.sqrt(np.mean((T_sim[i] - T_meas[i])**2))
-        ax.plot(t, T_meas[i], color=colors_m[i], alpha=0.5, lw=0.8, label=labels_m[i])
-        ax.plot(t, T_sim[i], color=colors_s[i], lw=1.5, ls='--',
-                label=f'Simulated (RMSE={rmse:.2f}°C)')
-        if i == 2:
-            ax.plot(t, Tamb, color='gray', alpha=0.4, lw=0.8, label='Tamb')
-        ax.set_ylabel('Temperature (°C)', fontsize=11)
-        ax.legend(fontsize=10, loc='upper left')
-        ax.set_title(titles[i], fontsize=12, fontweight='bold')
-        ax.grid(True, alpha=0.3)
+        rmse = np.sqrt(np.mean((T_sim[i]-T_meas[i])**2))
+        ax.plot(t, T_meas[i], color=cm[i], alpha=.6, lw=1, label=lm[i])
+        ax.plot(t, T_sim[i], color=cs[i], lw=1.8, ls='--', label=f'Sim (RMSE={rmse:.2f}°C)')
+        if np.any(lock_mask):
+            yl = (min(T_meas[i].min(),T_sim[i].min())-2, max(T_meas[i].max(),T_sim[i].max())+2)
+            ax.fill_between(t, yl[0], yl[1], where=lock_mask, alpha=.06, color='orange', label='Locked')
+            ax.set_ylim(yl)
+        if i==2: ax.plot(t, Tamb, color='gray', alpha=.4, lw=.8, label='Tamb')
+        ax.set_ylabel('Temp (°C)'); ax.legend(fontsize=9, loc='upper left')
+        ax.set_title(titles[i], fontweight='bold'); ax.grid(True, alpha=.3)
 
     ax = axes[3]
-    ax2 = ax.twinx()
-    l1 = ax.plot(t, I, color='#9b59b6', alpha=0.3, lw=0.5, label='Current (A)')
-    l2 = ax2.plot(t, omega, color='#e67e22', alpha=0.3, lw=0.5, label='Speed (rad/s)')
-    l3 = ax.plot(t, P1, color='#e74c3c', alpha=0.6, lw=1.0, label='P1 loss (W)')
-    l4 = ax.plot(t, P2, color='#3498db', alpha=0.6, lw=1.0, label='P2 loss (W)')
-    ax.set_xlabel('Time (s)', fontsize=11)
-    ax.set_ylabel('Current (A) / Power Loss (W)', fontsize=11)
-    ax2.set_ylabel('Angular Speed (rad/s)', fontsize=11)
-    lines = l1 + l2 + l3 + l4
-    ax.legend(lines, [l.get_label() for l in lines], fontsize=9, loc='upper left')
-    ax.set_title('Inputs: Current, Speed & Estimated Losses', fontsize=12, fontweight='bold')
-    ax.grid(True, alpha=0.3)
+    for i in range(3):
+        ax.plot(t, T_sim[i]-T_meas[i], color=cm[i], alpha=.7, lw=.8, label=f'{NODE_CN[i]} err')
+    ax.axhline(0, color='k', alpha=.3, lw=.5)
+    ax.set_ylabel('Error (°C)'); ax.legend(fontsize=9, loc='upper left')
+    ax.set_title('Error', fontweight='bold'); ax.grid(True, alpha=.3)
 
-    fig.suptitle('3-Node LPTN Thermal Network: Identification vs Measurement',
-                 fontsize=14, fontweight='bold', y=0.98)
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig(config['output_plot'], dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"\nPlot saved: {config['output_plot']}")
+    ax = axes[4]; ax2 = ax.twinx()
+    l1=ax.plot(t,I,color='#9b59b6',alpha=.3,lw=.5,label='I(A)')
+    l2=ax2.plot(t,omega,color='#e67e22',alpha=.3,lw=.5,label='ω(rad/s)')
+    l3=ax.plot(t,P1,color='#e74c3c',alpha=.6,lw=1,label='P1(W)')
+    l4=ax.plot(t,P2,color='#3498db',alpha=.6,lw=1,label='P2(W)')
+    ax.set_xlabel('Time (s)'); ax.set_ylabel('I(A)/Loss(W)'); ax2.set_ylabel('ω(rad/s)')
+    lines = l1+l2+l3+l4
+    ax.legend(lines,[l.get_label() for l in lines], fontsize=9, loc='upper left')
+    ax.set_title('Inputs & Losses', fontweight='bold'); ax.grid(True, alpha=.3)
 
-    # 保存参数 CSV
-    pd.DataFrame({
-        'Parameter': PARAM_NAMES,
-        'Value': params,
-        'Unit': PARAM_UNITS,
-        'Description': PARAM_DESC,
-    }).to_csv(config['output_params'], index=False, encoding='utf-8-sig')
-    print(f"Parameters saved: {config['output_params']}")
+    fig.suptitle('3-Node LPTN v3: Multi-Phase Identification', fontsize=14, fontweight='bold', y=.995)
+    plt.tight_layout(rect=[0,0,1,.98])
+    plt.savefig(config['output_plot'], dpi=150, bbox_inches='tight'); plt.close()
+    print(f"\nPlot: {config['output_plot']}")
+
+    pd.DataFrame({'Parameter':FULL_PARAM_NAMES,'Value':params,'Unit':PARAM_UNITS,'Description':PARAM_DESC}
+                 ).to_csv(config['output_params'], index=False, encoding='utf-8-sig')
+    print(f"Params: {config['output_params']}")
 
 
 # ============================================================
-# 5. 主入口
+# 主入口
 # ============================================================
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
+        print(__doc__); sys.exit(1)
 
     csv_files = sys.argv[1:]
-    print("=" * 60)
-    print("3-Node LPTN Thermal Network Parameter Identification")
-    print("=" * 60)
+    print("="*60)
+    print("3-Node LPTN v3: Multi-Phase Identification")
+    print("="*60)
 
-    print(f"\n[1/3] Loading {len(csv_files)} file(s)...")
+    print(f"\n[1/4] Loading {len(csv_files)} file(s)...")
     data = load_multiple(csv_files, CONFIG)
-    print(f"  Samples: {len(data)}, Time: {data['t'].min():.0f}~{data['t'].max():.0f} s")
-    print(f"  T1: {data['T1'].min():.1f}~{data['T1'].max():.1f}°C")
-    print(f"  T2: {data['T2'].min():.1f}~{data['T2'].max():.1f}°C")
-    print(f"  T3: {data['T3'].min():.1f}~{data['T3'].max():.1f}°C")
-    print(f"  I:  {data['I'].min():.2f}~{data['I'].max():.2f} A")
-    print(f"  ω:  {data['omega'].min():.2f}~{data['omega'].max():.2f} rad/s")
+    print(f"  {len(data)} pts, {data['t'].max()-data['t'].min():.0f}s")
+    print(f"  T1:{data['T1'].min():.1f}~{data['T1'].max():.1f} T2:{data['T2'].min():.1f}~{data['T2'].max():.1f} T3:{data['T3'].min():.1f}~{data['T3'].max():.1f}")
+    print(f"  I:{data['I'].min():.1f}~{data['I'].max():.1f}A  ω:{data['omega'].min():.1f}~{data['omega'].max():.1f}rad/s")
+    lf = np.mean(np.abs(data['omega'].values) < CONFIG['lock_speed_thresh'])
+    print(f"  Locked-rotor: {lf*100:.1f}%")
 
-    print(f"\n[2/3] Parameter identification...")
-    params, T0, t, I, omega, Tamb, T_meas = identify_parameters(data, CONFIG)
-    print_results(params)
+    t_total = time.time()
 
-    print("[3/3] Validation & visualization...")
+    print(f"\n[2/4] Phase-1: locked-rotor → C1, a_eff, R13")
+    p1 = run_phase1(data, CONFIG)
+
+    print(f"\n[3/4] Phase-2: full data → 15 params (C1 FIXED, a_lock = a_eff - a)")
+    params, T0, t, I, omega, Tamb, T_meas, ctx = identify_parameters(data, CONFIG, p1)
+    print_results(params, CONFIG)
+
+    print(f"\n[4/4] Validation & plot...")
     evaluate_and_plot(params, T0, t, I, omega, Tamb, T_meas, CONFIG)
 
-    print("\nDone!")
+    print(f"\nTotal time: {time.time()-t_total:.0f}s")
+    print("Done!")

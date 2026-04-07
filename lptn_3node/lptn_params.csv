@@ -1,17 +1,18 @@
 ﻿Parameter,Value,Unit,Description
-C1,27.850190904380128,J/K,Winding thermal capacitance
-C2,191.4888337700229,J/K,Driver thermal capacitance
-C3,393.3272776932651,J/K,Shell thermal capacitance
-R12,58.197342095742485,K/W,Winding↔Driver thermal resistance
-R13,2.030700196293443,K/W,Winding↔Shell thermal resistance
-R23,46.0649375407701,K/W,Driver↔Shell thermal resistance
-R2a,1.624159531436936,K/W,Driver↔Ambient thermal resistance
-R3a,1.029865377077705,K/W,Shell↔Ambient thermal resistance
-a,0.29169319119271536,W/A²,Copper loss coeff (I²)
-b,0.0,W·s/rad,Iron loss coeff (|ω|)
-c,0.09797005442931789,W·s²/rad²,Iron loss coeff (ω²)
-d,0.2810570875646567,W/A²,Driver conduction loss (I²)
-e,0.0,W/A,Driver switching loss (|I|)
-f,12.219028917550782,W,Driver standby loss (const)
-alpha_w,0.0,1/°C,Winding temp coefficient
-alpha_m,0.0,1/°C,MOS temp coefficient
+C1,59.167420298245894,J/K,Winding thermal capacitance
+C2,33.621959008942135,J/K,Driver thermal capacitance
+C3,1170.860833545962,J/K,Shell thermal capacitance
+R12,100.0,K/W,Winding-Driver resistance
+R13,0.8558826929964994,K/W,Winding-Shell resistance
+R23,76.515055348842,K/W,Driver-Shell resistance
+R2a,5.939265713990781,K/W,Driver-Ambient resistance
+R3a,0.5449543256503168,K/W,Shell-Ambient resistance
+a,0.05,W/A²,"Copper loss (I², running)"
+b,1.8512916080842698,W·s/rad,Iron loss (|ω|)
+c,0.22349506296072233,W·s²/rad²,Iron loss (ω²)
+d,0.0016237563564437713,W/A²,Driver conduction (I²)
+e,0.1067562462359785,W/A,Driver switching (|I|)
+f,4.935392128940451,W,Driver standby
+a_lock,0.5359207184929571,W/A²,Locked-rotor extra motor (FIXED)
+d_lock,0.026274542534618472,W/A²,Locked-rotor extra driver
+omega0,9.191856449335454,rad/s,Lock decay speed
